@@ -88,7 +88,7 @@ def plot_ratio_dep(channel_num, surface_time, surface_echo, surface_height, GNSS
     valid = (~np.isinf(RATIO)) & (RATIO > 1)
     mean_ratio = np.mean(RATIO[valid]) if np.any(valid) else np.nan
     print(f'表面下1米区域的退偏比 R_dep = {mean_ratio:.3f}')
-    plt.show()
+    #plt.show()
     return RATIO, mean_ratio
 
 def surface_echo_caculate(LIDAR_TIME, LIDAR_Z, surface_height, f, num, Z_RES, Z_max):
@@ -189,7 +189,6 @@ if __name__ == "__main__":
                     POINT_Y.append(h5f[f'/POINT_Y_CH{ch}'][:])
                     POINT_Z.append(h5f[f'/POINT_Z_CH{ch}'][:])
                     GNSS_SEC.append(h5f[f'/GNSS_SEC_CH{ch}'][:])
-
 
             # 可视化（open3d 替代 pcshow）
             for idx in [0, 2]:
