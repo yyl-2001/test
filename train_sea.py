@@ -2,100 +2,35 @@ import os
 import h5py
 import numpy as np
 from sklearn.neighbors import KDTree
-from sklearn.model_selection import train_test_split
 import xgboost as xgb
 import matplotlib.pyplot as plt
-from sklearn.metrics import classification_report
 from datetime import datetime
 import sys
+from eva import evaluate_model
+from prepare_train_data import list_h5_files, load_data_from_h5, prepare_seasurface_land_data, balanced_class_split
+from get_features_sea_land import extract_features_xyz
+from xgboost.callback import TrainingCallback
+
+class CustomEarlyStop(TrainingCallback):
+    def __init__(self, logloss_thresh=0.2, error_thresh=0.05):
+        self.logloss_thresh = logloss_thresh
+        self.error_thresh = error_thresh
+
+    def after_iteration(self, model, epoch, evals_log):
+        # 取验证集(eval)的 logloss 和 merror
+        logloss = evals_log['eval']['mlogloss'][-1]
+        merror  = evals_log['eval']['merror'][-1]
+
+        # 如果达到目标精度则提前停止
+        if logloss <= self.logloss_thresh or merror <= self.error_thresh:
+            print(f"✅ 达到目标精度 (logloss={logloss:.4f}, merror={merror:.4f})，提前停止")
+            return True
+        return False
+
 sys.dont_write_bytecode = True
 
-voxel_t = 1.0  # 时间体素大小
-voxel_z = 0.5  # 深度体素大小
-
-# =========================
-# 1. 文件读取
-# =========================
-def list_h5_files(root_dir, start_idx=0, end_idx=None):
-    all_files = [f for f in os.listdir(root_dir) if f.endswith('.h5')]
-    all_files.sort()
-    selected_files = all_files[start_idx:end_idx]
-    return [os.path.join(root_dir, f) for f in selected_files]
-
-def load_data_from_h5(filepath):
-    with h5py.File(filepath, 'r') as f:
-        ref_data = np.array(f['REF_DATA']).T  # Nx5
-        ch3_data = np.array(f['ORG_DATA_channel_3']).T  # Nx4, 暂未用
-    return ref_data, ch3_data
-
-# =========================
-# 2. 数据准备
-# =========================
-def prepare_train_data(ref_data):
-    labels = ref_data[:, 4].astype(int)
-    sea_mask = (labels == 1)
-    nonsea_mask = ~sea_mask
-    selected_mask = sea_mask | nonsea_mask
-
-    # 取 T 和 Z
-    points_tz = ref_data[selected_mask][:, [0, 3]]  # T, Z
-    labels_bin = np.zeros(points_tz.shape[0], dtype=int)
-    labels_bin[sea_mask[selected_mask]] = 1
-    return points_tz, labels_bin
-
-# =========================
-# 3. 特征提取
-# =========================
-def extract_features_tz(points, voxel_t, voxel_z, k=10):
-    """
-    输入: points [T, Z]
-    输出特征: [Z, center_density, ratio_center_up, flatness]
-    """
-    if points.shape[0] == 0:
-        return np.empty((0, 4))
-
-    # 1. 体素化
-    min_tz = points.min(axis=0)
-    ij = np.floor((points - min_tz) / np.array([voxel_t, voxel_z])).astype(int)
-    max_ij = ij.max(axis=0) + 1
-    voxel_count = np.zeros(max_ij, dtype=np.int32)
-
-    for idx in range(points.shape[0]):
-        voxel_count[ij[idx, 0], ij[idx, 1]] += 1
-
-    # 2. 中心密度
-    voxel_volume = voxel_t * voxel_z
-    current_count = np.maximum(1,voxel_count[ij[:, 0], ij[:, 1]])
-    center_density = current_count
-
-    # 3. 中心比上密度
-    up_j = ij[:, 1] + 1
-    up_valid = up_j < max_ij[1]
-    up_count = np.zeros(points.shape[0], dtype=np.int32)
-    up_count[up_valid] = np.maximum(1, voxel_count[ij[up_valid, 0], up_j[up_valid]])
-    up_density = up_count
-    ratio_center_up = center_density / np.maximum(1, up_density)
-
-    # 4. 平坦度
-    tree = KDTree(points)
-    _, idxs = tree.query(points, k=k+1)  # 包含自己
-    z_neighbors = points[idxs, 1]
-    flatness = np.std(z_neighbors, axis=1)
-
-    features = np.column_stack([
-        points[:, 1],  # Z
-        center_density,
-        ratio_center_up,
-        flatness
-    ])
-    feature_names = ['Z', 'Center_Density', 'Ratio_Center_Up', 'Flatness']
-    return features, feature_names
-
-# =========================
-# 4. 主流程
-# =========================
 def main():
-    root_dir = r'E:/DATA_0714/flight-02/train_sig2'
+    root_dir = r'E:/DATA_0714/flight-02/train_sea_land'
     start_idx = 0
     end_idx = 4
 
@@ -104,152 +39,90 @@ def main():
 
     all_features = []
     all_labels = []
-    
+    all_points = []  # 保存原始坐标
 
     for file in files:
         print(f"处理文件: {file}")
         ref_data, _ = load_data_from_h5(file)
-        points, labels = prepare_train_data(ref_data)
-        feats, feature_names = extract_features_tz(points, voxel_t, voxel_z, k=10)
+        points, labels = prepare_seasurface_land_data(ref_data,sea_height=-10.0)
+        feats, feature_names = extract_features_xyz(points, voxel_size=(0.25,0.5,1), k=10, mean_surface_height=-10.0)
         if feats.shape[0] == 0:
             print("该文件无训练数据，跳过")
             continue
         all_features.append(feats)
         all_labels.append(labels)
+        all_points.append(points)
 
     all_features = np.vstack(all_features)
     all_labels = np.hstack(all_labels)
-
+    all_points = np.vstack(all_points)
     print(f"总训练样本数: {all_features.shape[0]}")
     print("特征列名:", feature_names)
 
     # 划分数据
-    X_train, X_val, y_train, y_val = train_test_split(
-        all_features, all_labels, test_size=0.2, random_state=42, stratify=all_labels
+    X_train, X_val, y_train, y_val, pts_train, pts_val = balanced_class_split(
+    all_features, all_labels, all_points,
+    test_size=0.2,
+    random_state=42
     )
+
 
     # 转换为 DMatrix
     dtrain = xgb.DMatrix(X_train, label=y_train, feature_names=feature_names)
     dval = xgb.DMatrix(X_val, label=y_val, feature_names=feature_names)
 
     params = {
-        'max_depth': 6,
+        'max_depth': 8,
         'learning_rate': 0.1,
-        'objective': 'binary:logistic',
-        'eval_metric': 'logloss',
+        'objective': 'multi:softprob',
+        'num_class': 3,  # 0: Other, 1: Sea Surface, 2: Land
+        'eval_metric': ['mlogloss','merror'],
         'tree_method': 'hist'
     }
 
     evallist = [(dtrain, 'train'), (dval, 'eval')]
 
-    # 重新训练（不会加载旧模型）
+
+
+    # ====== 训练 ======
     model = xgb.train(
-        params,
-        dtrain,
-        num_boost_round=100,
-        evals=evallist,
-        early_stopping_rounds=20,
-        verbose_eval=True
-    )
+    params,
+    dtrain,
+    num_boost_round=300,
+    evals=[(dtrain,'train'), (dval,'eval')],
+    callbacks=[CustomEarlyStop(logloss_thresh=0.2, error_thresh=0.05)]
+)
+
 
     # 保存新模型（带时间戳）
-    model_name = f"sea_classifier_tz.model"
+    model_name = f"land_sea_classifier_tz.model"
+
+    val_preds = model.predict(dval).argmax(axis=1)
+    reverse_map = {0:0,1:1,2:2}
+    y_val_original = np.array([reverse_map[int(y)] for y in y_val])
+    val_preds_original = np.array([reverse_map[int(p)] for p in val_preds])
+
+    sea_height = np.min(pts_val[val_preds_original==1, 2]) if np.any(val_preds_original==1) else -10.0
+    print(f"sea_height = {sea_height}")
+    # 保存到模型
+    model.set_attr(sea_height=str(sea_height))
     model.save_model(model_name)
     print(f"模型已保存为: {model_name}")
 
-    # 验证集评估
-    val_preds = (model.predict(dval) > 0.5).astype(int)
-    val_acc = (val_preds == y_val).mean()
-    print(f"验证集准确率: {val_acc:.4f}")
-
-    # 特征重要性
-    importance_scores = model.get_score(importance_type='gain')
-    importance_dict = {fname: importance_scores.get(fname, 0) for fname in feature_names}
-    sorted_features = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
-
-    plt.figure(figsize=(6,4))
-    features_sorted, scores = zip(*sorted_features)
-    plt.bar(features_sorted, scores)
-    plt.xticks(rotation=45, ha='right')
-    plt.title('Feature Importance (Gain)')
-    plt.tight_layout()
-    plt.show()
-
-    print("\nFeature Importance Ranking:")
-    for feat, score in sorted_features:
-        print(f"{feat:15s}: {score:.4f}")
-
-    # 训练数据统计
-    print("\n=== 训练数据统计 ===")
-    train_stats = {
-        'mean': np.mean(X_train, axis=0),
-        'std': np.std(X_train, axis=0),
-        'min': np.min(X_train, axis=0),
-        'max': np.max(X_train, axis=0)
-    }
-    for i, fname in enumerate(feature_names):
-        print(f"{fname:15s}: mean={train_stats['mean'][i]:.3f}, std={train_stats['std'][i]:.3f}, "
-              f"range=[{train_stats['min'][i]:.3f}, {train_stats['max'][i]:.3f}]")
-
-    # 测试第4个文件
-    print("\n=== 预测第4个文件 ===")
-    test_files = list_h5_files(root_dir, start_idx=5, end_idx=6)
-    test_file = test_files[0]
-    print(f"预测文件: {test_file}")
-
-    ref_data, _ = load_data_from_h5(test_file)
-    points_tz = ref_data[:, [0, 3]]  # 全部点
-    true_labels = (ref_data[:, 4].astype(int) == 1).astype(int)
-
-    features,feature_names = extract_features_tz(points_tz, voxel_t, voxel_z, k=10)
-    dmat = xgb.DMatrix(features, feature_names=feature_names)
-    preds = (model.predict(dmat) > 0.5).astype(int)
-
-    test_acc = (preds == true_labels).mean()
-    print(f"测试准确率: {test_acc:.4f}")
-
-    # 分类报告
-    print("\n分类报告:")
-    print(classification_report(true_labels, preds, target_names=['Non-sea', 'Sea Surface']))
-
-    # 测试数据分布统计
-    print("\n测试数据统计:")
-    for i, fname in enumerate(feature_names):
-        test_mean = np.mean(features[:, i])
-        test_std = np.std(features[:, i])
-        test_min = np.min(features[:, i])
-        test_max = np.max(features[:, i])
-        print(f"{fname:15s}: mean={test_mean:.3f}, std={test_std:.3f}, range=[{test_min:.3f}, {test_max:.3f}]")
-        mean_shift = abs(test_mean - train_stats['mean'][i]) / (train_stats['std'][i] + 1e-6)
-        scale_ratio = test_std / (train_stats['std'][i] + 1e-6)
-        if mean_shift > 0.5 or scale_ratio < 0.5 or scale_ratio > 2:
-            print(f"警告: {fname} 特征分布偏移显著! 均值偏移={mean_shift:.2f}σ, 标准差比={scale_ratio:.2f}")
-
-    # 绘制预测与真实对比 (T-Z 投影)
     
-    z_mean = np.mean(ref_data[:,3])
-    z_min = z_mean - 2
-    z_max = z_mean + 2
-
-    plt.figure(figsize=(15, 5))
-    plt.subplot(121)
-    plt.scatter(points_tz[:, 0], points_tz[:, 1], c=true_labels, cmap='coolwarm', s=1, alpha=0.6)
-    plt.colorbar(ticks=[0,1])
-    plt.title('Ground Truth (Blue:Non-sea Red:Sea)')
-    plt.xlabel('T')
-    plt.ylabel('Z')
-    plt.ylim(z_min, z_max)
-
-    plt.subplot(122)
-    plt.scatter(points_tz[:, 0], points_tz[:, 1], c=preds, cmap='coolwarm', s=1, alpha=0.6)
-    plt.colorbar(ticks=[0,1])
-    plt.title('Predictions (Blue:Non-sea Red:Sea)')
-    plt.xlabel('T')
-    plt.ylabel('Z')
-    plt.ylim(z_min, z_max)
-    plt.tight_layout()
-    plt.show()
-    
+    label_names = {0:'Other', 1:'Sea Surface', 2:'land'}
+    # 调用统一评估函数
+    evaluate_model(
+        points_val = pts_val,
+        model = model,
+        X_val = X_val,
+        y_val = y_val,
+        label_names = label_names,
+        val_preds = val_preds,
+        feature_names = feature_names,
+        reverse_map = reverse_map,
+        title_prefix = "land and water"
+    )
 
 if __name__ == "__main__":
     print("\n" + "="*40)

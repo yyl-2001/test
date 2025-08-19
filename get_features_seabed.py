@@ -1,39 +1,63 @@
 import numpy as np
-import time
 from numba import njit
+from sklearn.neighbors import KDTree
+import time
 
-# ---------------- Numba 加速函数 ----------------
+# ---------------- Numba 工具 ----------------
+from numba import njit
+import numpy as np
+
 @njit
 def _points_to_bins_numba(xyz, edges0, edges1, edges2):
+    """
+    将点映射到体素索引，自动防越界
+    """
     N = xyz.shape[0]
     ix = np.empty(N, dtype=np.int32)
     iy = np.empty(N, dtype=np.int32)
     iz = np.empty(N, dtype=np.int32)
+    
+    max_x = len(edges0) - 2
+    max_y = len(edges1) - 2
+    max_z = len(edges2) - 2
+    
     for i in range(N):
-        # x
         xi = 0
-        while xi < len(edges0)-1 and xyz[i,0] >= edges0[xi+1]:
+        while xi < max_x and xyz[i,0] >= edges0[xi+1]:
             xi += 1
         ix[i] = xi
-        # y
+        
         yi = 0
-        while yi < len(edges1)-1 and xyz[i,1] >= edges1[yi+1]:
+        while yi < max_y and xyz[i,1] >= edges1[yi+1]:
             yi += 1
         iy[i] = yi
-        # z
+        
         zi = 0
-        while zi < len(edges2)-1 and xyz[i,2] >= edges2[zi+1]:
+        while zi < max_z and xyz[i,2] >= edges2[zi+1]:
             zi += 1
         iz[i] = zi
     return ix, iy, iz
 
 @njit
 def _gather_from_grid_numba(grid, ix, iy, iz):
+    """
+    从三维网格提取值，自动防越界
+    """
     N = ix.shape[0]
-    vals = np.empty(N, dtype=np.float32)
+    vals = np.zeros(N, dtype=np.float32)
+    
+    if grid.size == 0:
+        # 空网格，返回全0
+        return vals
+    
+    X, Y, Z = grid.shape
     for i in range(N):
-        vals[i] = grid[ix[i], iy[i], iz[i]]
+        xi = min(max(ix[i],0), X-1)
+        yi = min(max(iy[i],0), Y-1)
+        zi = min(max(iz[i],0), Z-1)
+        vals[i] = grid[xi, yi, zi]
     return vals
+
 
 @njit
 def _box_sum3d_numba(arr, r=1):
@@ -68,57 +92,40 @@ def _local_mean_var_from_counts_numba(counts,r=1):
     var = np.clip(var,0,None)
     return mean, var
 
-@njit
-def _depth_layer_norm_numba(values, depths, bin_edges):
-    eps = 1e-6
-    N = values.shape[0]
-    nbins = len(bin_edges)-1
-    b = np.empty(N,dtype=np.int32)
-    for i in range(N):
-        bi = 0
-        while bi < nbins-1 and depths[i] >= bin_edges[bi+1]:
-            bi += 1
-        b[i] = bi
-    layer_sum = np.zeros(nbins,dtype=np.float32)
-    layer_cnt = np.zeros(nbins,dtype=np.int32)
-    for i in range(N):
-        layer_sum[b[i]] += values[i]
-        layer_cnt[b[i]] += 1
-    layer_mean = np.empty(nbins,dtype=np.float32)
-    for i in range(nbins):
-        if layer_cnt[i] > 0:
-            layer_mean[i] = layer_sum[i]/layer_cnt[i]
-        else:
-            layer_mean[i] = eps
-    out = np.empty(N,dtype=np.float32)
-    for i in range(N):
-        out[i] = values[i]/(layer_mean[b[i]]+eps)
-    return out
-
-# ---------------- 工具函数 ----------------
 def _make_edges(min_v, max_v, step):
     return np.arange(min_v, max_v + step*1.0001, step)
 
 def _hist3d_counts(xyz, edges):
+    if xyz.shape[0]==0:
+        return np.zeros((len(edges[0])-1,len(edges[1])-1,len(edges[2])-1), dtype=np.float32)
     return np.histogramdd(xyz, bins=edges)[0].astype(np.float32)
 
-# ---------------- 主特征提取 ----------------
+# ---------------- 水下特征提取 ----------------
 def extract_underwater_features(points, ch3_data,
-                                voxel_scales=(0.25,0.5,1.0),
+                                H_surface,
+                                voxel_scales,
                                 neigh_radius=1,
-                                depth_bins=np.arange(-40,-7,1)):
+                                knn_k=10):
+    """
+    多尺度水下特征提取：
+    - 小/中尺度: DensityWeighted, Density, KNNDensity weighted & unweighted
+    - 最大尺度: LocalVar, Depol
+    """
     t0 = time.time()
-    if points.shape[0]==0:
+    N = points.shape[0]
+    if N==0:
         fns = []
-        for s in voxel_scales:
-            fns += [f'LocalVar_s{s}', f'Depol_s{s}', f'LocalMean_s{s}',
-                    f'DensityNorm_s{s}', f'DepolNorm_s{s}']
-        return np.empty((0,len(fns))), fns
+        for s in voxel_scales[:-1]:  # 小/中尺度
+            fns += [f'DensityWeighted_s{s}', f'Density_s{s}',
+                    f'KNNDensity_s{s}', f'KNNDensity_unweighted_s{s}']
+        # 最大尺度特征
+        fns += [f'LocalVar_s{voxel_scales[-1]}', f'Depol_s{voxel_scales[-1]}']
+        return np.empty((0,len(fns)), dtype=np.float32), fns
 
     eps = 1e-6
-    xyz = points[:,:3].astype(np.float32)
-    ch3_xyz = ch3_data[:,1:4].astype(np.float32)
-    depths = xyz[:,2]
+    xyz = np.ascontiguousarray(points[:,:3], dtype=np.float32)
+    ch3_xyz = np.ascontiguousarray(ch3_data[:,:3], dtype=np.float32)
+    Z = xyz[:,2]
 
     lo = np.minimum(xyz.min(axis=0), ch3_xyz.min(axis=0))
     hi = np.maximum(xyz.max(axis=0), ch3_xyz.max(axis=0))
@@ -126,35 +133,51 @@ def extract_underwater_features(points, ch3_data,
     features_per_scale = []
     feature_names = []
 
-    for s in voxel_scales:
-        edges = [_make_edges(lo[d], hi[d], s) for d in range(3)]
-        # 主通道 / ch3 的 3D 密度网格
+    depth_weight = np.maximum((H_surface - Z)**2, 1.0).astype(np.float32)
+    tree = KDTree(xyz) if N>1 else None
+
+    # 小/中尺度处理
+    for s in voxel_scales[:-1]:
+        if tree is not None:
+            dists, _ = tree.query(xyz, k=min(knn_k+1,N))
+            knn_dist = dists[:,-1] * s
+            knn_density_weighted = depth_weight / (knn_dist + eps)
+            knn_density_unweighted = 1.0 / (knn_dist + eps)
+        else:
+            knn_density_weighted = depth_weight.copy()
+            knn_density_unweighted = np.ones_like(depth_weight)
+
+        edges = [np.array(_make_edges(lo[d], hi[d], s), dtype=np.float32) for d in range(3)]
         main_counts = _hist3d_counts(xyz, edges)
-        ch3_counts  = _hist3d_counts(ch3_xyz, edges)
-
-        # 邻域统计
-        local_mean, local_var = _local_mean_var_from_counts_numba(main_counts, r=neigh_radius)
-
-        # 体素索引一次性计算
         ix, iy, iz = _points_to_bins_numba(xyz, edges[0], edges[1], edges[2])
-
-        # 取体素值
         center_density = _gather_from_grid_numba(main_counts, ix, iy, iz)
-        depol = _gather_from_grid_numba(ch3_counts, ix, iy, iz)/(center_density+eps)
-        loc_mean_pt = _gather_from_grid_numba(local_mean, ix, iy, iz)
-        loc_var_pt  = _gather_from_grid_numba(local_var,  ix, iy, iz)
 
-        # 深度分层归一化
-        dens_norm  = _depth_layer_norm_numba(center_density, depths, depth_bins)
-        depol_norm = _depth_layer_norm_numba(depol, depths, depth_bins)
+        density_weighted = center_density * depth_weight
+        density_unweighted = center_density
 
-        # 拼接该尺度特征
-        feats_s = np.column_stack([loc_var_pt, depol, loc_mean_pt, dens_norm, depol_norm])
-        features_per_scale.append(feats_s)
+        feats_s = [density_weighted, density_unweighted,
+                   knn_density_weighted, knn_density_unweighted]
+        features_per_scale.append(np.column_stack(feats_s))
+        feature_names += [f'DensityWeighted_s{s}', f'Density_s{s}',
+                          f'KNNDensity_s{s}', f'KNNDensity_unweighted_s{s}']
 
-        feature_names += [f'LocalVar_s{s}', f'Depol_s{s}', f'LocalMean_s{s}',
-                          f'DensityNorm_s{s}', f'DepolNorm_s{s}']
+    # 最大尺度 LocalVar / Depol
+    max_s = voxel_scales[-1]
+    edges_max = [np.array(_make_edges(lo[d], hi[d], max_s), dtype=np.float32) for d in range(3)]
+    counts_max = _hist3d_counts(xyz, edges_max)
+    ch3_counts_max = _hist3d_counts(ch3_xyz, edges_max)
+    local_mean, local_var = _local_mean_var_from_counts_numba(counts_max, r=neigh_radius)
+    ix_max, iy_max, iz_max = _points_to_bins_numba(xyz, edges_max[0], edges_max[1], edges_max[2])
+    loc_var_pt = _gather_from_grid_numba(local_var, ix_max, iy_max, iz_max)
+    depol_pt = _gather_from_grid_numba(ch3_counts_max, ix_max, iy_max, iz_max) / (_gather_from_grid_numba(counts_max, ix_max, iy_max, iz_max)+eps)
+
+    features_per_scale.append(np.column_stack([loc_var_pt, depol_pt]))
+    feature_names += [f'LocalVar_s{max_s}', f'Depol_s{max_s}']
 
     features = np.hstack(features_per_scale).astype(np.float32)
-    print(f"[Feature extraction] {points.shape[0]} points, {features.shape[1]} features, time={time.time()-t0:.3f}s")
+    print(f"[Feature extraction] {N} points, {features.shape[1]} features, time={time.time()-t0:.3f}s")
     return features, feature_names
+
+
+
+
